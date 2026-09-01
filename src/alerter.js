@@ -1,80 +1,73 @@
 /**
- * DiscordAlerter — trade entry/win/loss alerts via Discord webhook (optional)
+ * WhatsAppAlerter — sends trade entry/win/loss alerts via WhatsApp using CallMeBot
+ *
+ * Setup:
+ *   1. Go to https://callmebot.com/whatsapp.php
+ *   2. Send the WhatsApp message "CallMeBot" to the number shown on the site
+ *   3. You'll receive an API key
+ *   4. Set WHATSAPP_PHONE and WHATSAPP_API_KEY in your env vars
+ *
+ * The free tier allows ~30 messages/day — enough for trade alerts.
  */
-class DiscordAlerter {
-  constructor(webhookUrl) {
-    this.webhookUrl = webhookUrl || process.env.DISCORD_WEBHOOK_URL || '';
-    this.enabled = !!this.webhookUrl;
-    console.log(this.enabled ? '🔔 Discord alerter: ENABLED' : '🔔 Discord alerter: DISABLED (set DISCORD_WEBHOOK_URL to enable)');
+
+class WhatsAppAlerter {
+  constructor({ phone, apiKey } = {}) {
+    this.phone = phone || process.env.WHATSAPP_PHONE || '';
+    this.apiKey = apiKey || process.env.WHATSAPP_API_KEY || '';
+    this.enabled = !!(this.phone && this.apiKey);
+    console.log(this.enabled ? '🔔 WhatsApp alerter: ENABLED' : '🔔 WhatsApp alerter: DISABLED (set WHATSAPP_PHONE + WHATSAPP_API_KEY to enable)');
   }
 
-  async _send(payload) {
+  async _send(text) {
     if (!this.enabled) return;
     try {
-      const res = await fetch(this.webhookUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-      if (!res.ok) console.error(`[Discord] Webhook failed: ${res.status}`);
+      const url = `https://api.callmebot.com/whatsapp.php?phone=${encodeURIComponent(this.phone)}&text=${encodeURIComponent(text)}&apikey=${encodeURIComponent(this.apiKey)}`;
+      const res = await fetch(url);
+      if (!res.ok) console.error(`[WhatsApp] Alert failed: ${res.status} ${res.statusText}`);
     } catch (err) {
-      console.error(`[Discord] Webhook error: ${err.message}`);
+      console.error(`[WhatsApp] Alert error: ${err.message}`);
     }
   }
 
+  _fmt(trade) {
+    const lines = [];
+    for (const [k, v] of Object.entries(trade)) {
+      if (v != null && v !== '') lines.push(`${k}: ${v}`);
+    }
+    return lines.join('\n');
+  }
+
   async sendEntry({ assetId, side, band, buyPrice, upPrice, downPrice, instId, totalTrades }) {
-    const embed = {
-      title: `🔥 ENTRY — ${assetId} ${side}`,
-      color: 0xffa500,
-      fields: [
-        { name: 'Asset', value: assetId, inline: true },
-        { name: 'Direction', value: side, inline: true },
-        { name: 'Setup', value: band, inline: true },
-        { name: 'Entry', value: `$${buyPrice.toFixed(2)}`, inline: true },
-        { name: 'TP', value: `$${upPrice.toFixed(2)}`, inline: true },
-        { name: 'SL', value: `$${downPrice.toFixed(2)}`, inline: true },
-        { name: 'Contract', value: `\`${instId}\``, inline: false },
-      ],
-      footer: { text: `OKX EMA+BOS Bot • Trade #${totalTrades}` },
-      timestamp: new Date().toISOString(),
-    };
-    await this._send({ embeds: [embed] });
+    const msg = `🔥 ENTRY — ${assetId} ${side}\n` +
+      `Setup: ${band}\n` +
+      `Entry: $${buyPrice.toFixed(2)}\n` +
+      `TP: $${upPrice.toFixed(2)}\n` +
+      `SL: $${downPrice.toFixed(2)}\n` +
+      `Contract: ${instId}\n` +
+      `Trade #${totalTrades}`;
+    await this._send(msg);
   }
 
   async sendWin({ assetId, side, band, buyPrice, sellPrice, profit, winrate, wins, losses, totalTrades }) {
-    const embed = {
-      title: `🎉 WIN — ${assetId} ${side}`,
-      color: 0x00ff00,
-      fields: [
-        { name: 'Asset', value: assetId, inline: true },
-        { name: 'Direction', value: side, inline: true },
-        { name: 'Setup', value: band, inline: true },
-        { name: 'Entry', value: `$${buyPrice.toFixed(2)}`, inline: true },
-        { name: 'Exit', value: `$${sellPrice.toFixed(2)}`, inline: true },
-        { name: 'Profit', value: `$${profit.toFixed(4)}`, inline: true },
-        { name: 'Winrate', value: `${winrate.toFixed(1)}% (${wins}W/${losses}L)`, inline: true },
-        { name: 'Total Trades', value: `${totalTrades}`, inline: true },
-      ],
-      footer: { text: `OKX EMA+BOS Bot` },
-      timestamp: new Date().toISOString(),
-    };
-    await this._send({ embeds: [embed] });
+    const msg = `🎉 WIN — ${assetId} ${side}\n` +
+      `Setup: ${band}\n` +
+      `Entry: $${buyPrice.toFixed(2)}\n` +
+      `Exit: $${sellPrice.toFixed(2)}\n` +
+      `Profit: $${profit.toFixed(4)}\n` +
+      `Winrate: ${winrate.toFixed(1)}% (${wins}W/${losses}L)\n` +
+      `Total Trades: ${totalTrades}`;
+    await this._send(msg);
   }
 
   async sendLoss({ assetId, side, band, buyPrice, loss, winrate, wins, losses, totalTrades }) {
-    const embed = {
-      title: `💀 LOSS — ${assetId} ${side}`,
-      color: 0xff0000,
-      fields: [
-        { name: 'Asset', value: assetId, inline: true },
-        { name: 'Direction', value: side, inline: true },
-        { name: 'Setup', value: band, inline: true },
-        { name: 'Entry', value: `$${buyPrice.toFixed(2)}`, inline: true },
-        { name: 'Loss', value: `$${Math.abs(loss).toFixed(4)}`, inline: true },
-        { name: 'Winrate', value: `${winrate.toFixed(1)}% (${wins}W/${losses}L)`, inline: true },
-        { name: 'Total Trades', value: `${totalTrades}`, inline: true },
-      ],
-      footer: { text: `OKX EMA+BOS Bot` },
-      timestamp: new Date().toISOString(),
-    };
-    await this._send({ embeds: [embed] });
+    const msg = `💀 LOSS — ${assetId} ${side}\n` +
+      `Setup: ${band}\n` +
+      `Entry: $${buyPrice.toFixed(2)}\n` +
+      `Loss: $${Math.abs(loss).toFixed(4)}\n` +
+      `Winrate: ${winrate.toFixed(1)}% (${wins}W/${losses}L)\n` +
+      `Total Trades: ${totalTrades}`;
+    await this._send(msg);
   }
 }
 
-module.exports = DiscordAlerter;
+module.exports = WhatsAppAlerter;
