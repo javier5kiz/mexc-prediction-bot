@@ -1,212 +1,303 @@
-/**
- * okxClient.js — OKX API Client (public market data + private trading)
- */
 const crypto = require('crypto');
-const logger = require('./logger');
 
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-
+/**
+ * OKXClient — Perpetual Swap (Futures) trading client
+ * Supports: BTC-USDT-SWAP, ETH-USDT-SWAP with isolated margin, cross leverage,
+ * attached TP/SL algo orders, breakeven amendment, position + PnL tracking.
+ */
 class OKXClient {
-  constructor(cfg) {
-    this.apiKey = cfg.apiKey || '';
-    this.secretKey = cfg.secretKey || '';
-    this.passphrase = cfg.passphrase || '';
-    this.isDemo = cfg.isDemo || false;
-    this.baseURL = cfg.baseURL || 'https://www.okx.com';
-    this._lastReq = 0;
-    this._minGap = 120;
+  constructor(config = {}) {
+    this.apiKey = config.apiKey || process.env.OKX_API_KEY || '';
+    this.secretKey = config.secretKey || process.env.OKX_SECRET_KEY || '';
+    this.passphrase = config.passphrase || process.env.OKX_PASSPHRASE || '';
+    this.isSimulated = config.isSimulated || process.env.IS_DEMO === 'true' || false;
+    this.baseURL = config.baseURL || process.env.OKX_BASE_URL || 'https://www.okx.com';
+    this._accountMode = null;
+    this._instrumentCache = {}; // instId -> { ctVal, lotSz, minSz }
   }
 
-  _sign(timestamp, method, path, body = '') {
-    const msg = timestamp + method.toUpperCase() + path + body;
-    return crypto.createHmac('sha256', this.secretKey).update(msg).digest('base64');
-  }
+  _getHeaders(method, requestPath, body = '') {
+    const timestamp = new Date().toISOString();
+    const bodyStr = body ? JSON.stringify(body) : '';
+    const message = timestamp + method.toUpperCase() + requestPath + bodyStr;
+    const signature = crypto.createHmac('sha256', this.secretKey).update(message).digest('base64');
 
-  _headers(method, path, body = '', isPrivate = false) {
-    if (!isPrivate) return { 'Content-Type': 'application/json' };
-    if (!this.apiKey) throw new Error('API keys required for private endpoints');
-    const ts = new Date().toISOString();
-    const sign = this._sign(ts, method, path, body);
-    const h = {
+    const headers = {
       'OK-ACCESS-KEY': this.apiKey,
-      'OK-ACCESS-SIGN': sign,
-      'OK-ACCESS-TIMESTAMP': ts,
+      'OK-ACCESS-SIGN': signature,
+      'OK-ACCESS-TIMESTAMP': timestamp,
       'OK-ACCESS-PASSPHRASE': this.passphrase,
       'Content-Type': 'application/json',
     };
-    if (this.isDemo) h['x-simulated-trading'] = '1';
-    return h;
+    if (this.isSimulated) headers['x-simulated-trading'] = '1';
+    return headers;
   }
 
-  async _request(method, endpoint, params = null, body = null, isPrivate = false) {
-    let path = endpoint;
-    if (params && method === 'GET') {
-      path += '?' + new URLSearchParams(params).toString();
-    }
-    const url = this.baseURL + path;
-    const bodyStr = body ? JSON.stringify(body) : '';
-    const gap = Date.now() - this._lastReq;
-    if (gap < this._minGap) await sleep(this._minGap - gap);
-    this._lastReq = Date.now();
+  async _request(method, path, data = null, isPrivate = false) {
     try {
-      const headers = this._headers(method, path, bodyStr, isPrivate);
-      const res = await fetch(url, { method, headers, body: bodyStr || undefined });
-      const json = await res.json();
-      return json;
+      const url = `${this.baseURL}${path}`;
+      const headers = isPrivate ? this._getHeaders(method, path, data) : { 'Content-Type': 'application/json' };
+      const options = { method, headers };
+      if (data && (method === 'POST' || method === 'PUT')) options.body = JSON.stringify(data);
+      const res = await fetch(url, options);
+      return await res.json();
     } catch (err) {
-      return { code: '-1', msg: err.message, data: [] };
+      console.error(`[OKXClient Error] ${method} ${path}:`, err.message);
+      return { code: '-1', msg: err.message || String(err), data: [] };
     }
   }
 
-  // PUBLIC: Get spot price
-  async getSpotPrice(instId) {
-    const res = await this._request('GET', '/api/v5/market/ticker', { instId });
-    const d = res.data?.[0];
-    return d ? +d.last : null;
+  async throttle(ms = 200) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  // PUBLIC: Get event contract ticker
-  async getEventTicker(instId) {
-    const res = await this._request('GET', '/api/v5/market/ticker', { instId });
-    const d = res.data?.[0];
-    if (!d) return null;
-    return {
-      instId: d.instId,
-      last:   d.last ? +d.last : null,
-      bidPx:  d.bidPx ? +d.bidPx : 0,
-      askPx:  d.askPx ? +d.askPx : 0,
-      bidSz:  d.bidSz ? +d.bidSz : 0,
-      askSz:  d.askSz ? +d.askSz : 0,
-    };
+  // ═══════════════════════════════════════════════════════════════
+  //  Account Setup
+  // ═══════════════════════════════════════════════════════════════
+
+  async auth() {
+    console.log('🔑 Authenticating with OKX API...');
+    const res = await this.getUSDTBalanceRaw();
+    if (res && res.code === '0') {
+      console.log('✅ OKX Authentication successful!');
+      await this.getAccountConfig();
+      return true;
+    }
+    console.error('❌ OKX Authentication failed:', res?.msg || 'Unknown error');
+    return false;
   }
 
-  // PUBLIC: Get active event contract with strike price
-  async getActiveContract(seriesId) {
-    const path = `/api/v5/public/instruments?instType=EVENTS&seriesId=${encodeURIComponent(seriesId)}`;
-    const res = await this._request('GET', path);
+  async getAccountConfig() {
+    if (this._accountMode !== null) return this._accountMode;
+    const res = await this._request('GET', '/api/v5/account/config', null, true);
+    if (res && res.code === '0' && res.data && res.data[0]) {
+      const config = res.data[0];
+      this._accountMode = {
+        acctLv: parseInt(config.acctLv || '1', 10),
+        posMode: config.posMode,
+      };
+      const lvNames = { 1: 'Spot', 2: 'Single-margin', 3: 'Multi-margin', 4: 'Portfolio' };
+      console.log(`📋 Account: mode=${this._accountMode.acctLv} (${lvNames[this._accountMode.acctLv] || '?'}), posMode=${this._accountMode.posMode}`);
+      if (this._accountMode.acctLv === 1) {
+        console.warn('⚠️  Account is in SPOT mode — perpetual SWAP trading with leverage requires Single-currency margin mode or higher.');
+        console.warn('⚠️  Switch it in OKX (demo) → Settings → Account mode, otherwise leveraged orders will fail.');
+      }
+    } else {
+      console.warn('⚠️ Could not fetch account config.');
+      this._accountMode = { acctLv: 1 };
+    }
+    return this._accountMode;
+  }
+
+  /**
+   * Ensure account is in long_short_mode (hedge mode) so posSide can be used.
+   * Position mode is account-wide (applies to all SWAP instruments), not per-instrument.
+   */
+  async ensureHedgeMode() {
+    const body = { posMode: 'long_short_mode' };
+    const res = await this._request('POST', '/api/v5/account/set-position-mode', body, true);
+    if (res && res.code === '0') {
+      console.log('✅ Position mode set to long_short_mode (hedge mode)');
+    } else {
+      console.warn(`⚠️ Could not set position mode: ${res?.msg} (code=${res?.code}) — may already be set, or positions are open.`);
+    }
+    return res;
+  }
+
+  async setLeverage(instId, lever, mgnMode = 'isolated', posSide = null) {
+    const body = { instId, lever: String(lever), mgnMode };
+    if (posSide) body.posSide = posSide;
+    const res = await this._request('POST', '/api/v5/account/set-leverage', body, true);
+    if (res && res.code === '0') {
+      console.log(`✅ Leverage set: ${instId} ${posSide || ''} ${lever}x (${mgnMode})`);
+    } else {
+      console.warn(`⚠️ setLeverage failed for ${instId} ${posSide || ''}: ${res?.msg} (code=${res?.code})`);
+    }
+    return res;
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  Instrument Specs
+  // ═══════════════════════════════════════════════════════════════
+
+  async getInstrumentSpecs(instId) {
+    if (this._instrumentCache[instId]) return this._instrumentCache[instId];
+    const path = `/api/v5/public/instruments?instType=SWAP&instId=${encodeURIComponent(instId)}`;
+    const res = await this._request('GET', path, null, false);
+    if (res && res.code === '0' && res.data && res.data[0]) {
+      const d = res.data[0];
+      const specs = {
+        ctVal: parseFloat(d.ctVal || '0.01'),
+        ctValCcy: d.ctValCcy,
+        lotSz: parseFloat(d.lotSz || '1'),
+        minSz: parseFloat(d.minSz || '1'),
+        tickSz: parseFloat(d.tickSz || '0.1'),
+      };
+      this._instrumentCache[instId] = specs;
+      return specs;
+    }
+    console.warn(`⚠️ Could not fetch instrument specs for ${instId}, using fallback`);
+    return { ctVal: 0.01, lotSz: 1, minSz: 1, tickSz: 0.1 };
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  Market Data
+  // ═══════════════════════════════════════════════════════════════
+
+  async getKlineCandles(instId, bar = '5m', limit = 100) {
+    const path = `/api/v5/market/candles?instId=${encodeURIComponent(instId)}&bar=${bar}&limit=${limit}`;
+    const res = await this._request('GET', path, null, false);
     if (res && res.code === '0' && Array.isArray(res.data) && res.data.length > 0) {
-      const now = Date.now();
-      const active = res.data
-        .map(item => ({
-          instId: item.instId,
-          stk: parseFloat(item.stk || '0'),
-          expTime: parseInt(item.expTime || '0', 10),
-          state: item.state,
-          lotSz: parseFloat(item.lotSz || '0.1'),
-        }))
-        .filter(c => c.state === 'live' && c.expTime > now && c.stk > 0)
-        .sort((a, b) => a.expTime - b.expTime);
-      return active[0] || null;
+      return res.data.map((c) => ({
+        ts: parseInt(c[0], 10),
+        open: parseFloat(c[1]),
+        high: parseFloat(c[2]),
+        low: parseFloat(c[3]),
+        close: parseFloat(c[4]),
+        vol: parseFloat(c[5]),
+        confirm: parseInt(c[8] || '0', 10),
+      }));
+    }
+    return [];
+  }
+
+  async getMarkPrice(instId) {
+    const path = `/api/v5/public/mark-price?instType=SWAP&instId=${encodeURIComponent(instId)}`;
+    const res = await this._request('GET', path, null, false);
+    if (res && res.code === '0' && res.data && res.data[0]) {
+      return parseFloat(res.data[0].markPx);
     }
     return null;
   }
 
-  // PRIVATE: Get USDT balance — checks BOTH trading + funding accounts
-  // OKX event contracts are funded from the trading (unified) account.
-  // But users may have funds in the funding account — we check both and log each.
+  // ═══════════════════════════════════════════════════════════════
+  //  Balance
+  // ═══════════════════════════════════════════════════════════════
+
+  async getUSDTBalanceRaw() {
+    return this._request('GET', '/api/v5/account/balance', null, true);
+  }
+
   async getUSDTBalance() {
-    let tradingBal = 0;
-    let fundingBal = 0;
-
-    try {
-      // 1. Unified trading account
-      const tradingRes = await this._request('GET', '/api/v5/account/balance', { ccy: 'USDT' }, null, true);
-      logger.info(`  [balance] Trading account raw: code=${tradingRes.code} dataLen=${tradingRes.data?.length ?? 0}`);
-      if (tradingRes.code === '0' && tradingRes.data?.[0]) {
-        const det = tradingRes.data[0].details?.find(d => d.ccy === 'USDT');
-        if (det) {
-          tradingBal = +det.availBal || 0;
-          logger.info(`  [balance] Trading USDT availBal=${det.availBal} eqUsd=${det.eqUsd || '?'}`);
-        } else {
-          // Log all currencies found so we can debug
-          const ccys = (tradingRes.data[0].details || []).map(d => `${d.ccy}=${d.availBal}`).join(', ');
-          logger.info(`  [balance] Trading account currencies: ${ccys || '(none)'}`);
-        }
-      } else {
-        logger.warn(`  [balance] Trading account error: ${tradingRes.msg || JSON.stringify(tradingRes)}`);
-      }
-    } catch (e) {
-      logger.warn(`  [balance] Trading account fetch error: ${e.message}`);
-    }
-
-    try {
-      // 2. Funding account (asset balance)
-      const fundingRes = await this._request('GET', '/api/v5/asset/balances', { ccy: 'USDT' }, null, true);
-      logger.info(`  [balance] Funding account raw: code=${fundingRes.code} dataLen=${fundingRes.data?.length ?? 0}`);
-      if (fundingRes.code === '0' && Array.isArray(fundingRes.data)) {
-        const det = fundingRes.data.find(d => d.ccy === 'USDT');
-        if (det) {
-          fundingBal = +det.availBal || 0;
-          logger.info(`  [balance] Funding USDT availBal=${det.availBal}`);
-        } else {
-          const ccys = fundingRes.data.map(d => `${d.ccy}=${d.availBal}`).join(', ');
-          logger.info(`  [balance] Funding account currencies: ${ccys || '(none)'}`);
-        }
-      } else {
-        logger.warn(`  [balance] Funding account error: ${fundingRes.msg || JSON.stringify(fundingRes)}`);
-      }
-    } catch (e) {
-      logger.warn(`  [balance] Funding account fetch error: ${e.message}`);
-    }
-
-    const total = tradingBal + fundingBal;
-    logger.info(`  [balance] Trading: $${tradingBal.toFixed(4)} | Funding: $${fundingBal.toFixed(4)} | Total: $${total.toFixed(4)}`);
-    return total;
-  }
-
-  // PRIVATE: Get order details
-  async getOrderDetails(ordId, instId) {
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      const params = { ordId };
-      if (instId) params.instId = instId;
-      const res = await this._request('GET', '/api/v5/trade/order', params, null, true);
-      const d = res.data?.[0];
-      if (d) {
-        return {
-          ordId: d.ordId,
-          state: d.state,
-          fillPx: d.fillPx ? +d.fillPx : 0,
-          fillSz: d.fillSz ? +d.fillSz : 0,
-          avgPx: d.avgPx ? +d.avgPx : 0,
-        };
-      }
-      if (attempt < 3) await sleep(1000);
+    const res = await this.getUSDTBalanceRaw();
+    if (res && res.code === '0' && Array.isArray(res.data)) {
+      const detail = res.data[0]?.details?.find((d) => d.ccy === 'USDT');
+      return detail ? parseFloat(detail.availBal || detail.eq || '0') : 0;
     }
     return null;
   }
 
-  // PRIVATE: Place market order
-  async placeMarketOrder(instId, side, size, outcome) {
-    const okxOutcome = outcome === 'UP' ? 'yes' : 'no';
+  // ═══════════════════════════════════════════════════════════════
+  //  Orders — Entry with Attached TP/SL
+  // ═══════════════════════════════════════════════════════════════
+
+  /**
+   * Place a market entry order with an attached TP/SL (OCO) that OKX manages natively.
+   * side: 'buy' (open long) | 'sell' (open short)
+   * posSide: 'long' | 'short'
+   */
+  async placeSwapEntryOrder({ instId, side, posSide, sz, tpTriggerPx, slTriggerPx, mgnMode = 'isolated' }) {
+    const clOrdId = `bos${Date.now()}`.slice(0, 32);
     const body = {
       instId,
-      tdMode: 'isolated',
+      tdMode: mgnMode,
       side,
+      posSide,
       ordType: 'market',
-      sz: String(size),
-      outcome: okxOutcome,
+      sz: String(sz),
+      attachAlgoOrds: [
+        {
+          attachAlgoClOrdId: clOrdId,
+          tpTriggerPx: String(tpTriggerPx),
+          tpOrdPx: '-1',
+          tpTriggerPxType: 'last',
+          slTriggerPx: String(slTriggerPx),
+          slOrdPx: '-1',
+          slTriggerPxType: 'last',
+        },
+      ],
     };
-    logger.info(`📤 Order: ${instId} ${side} ${size} ${okxOutcome}`);
-    const res = await this._request('POST', '/api/v5/trade/order', null, body, true);
-    const d = res?.data?.[0] || {};
-    const ordId = d.ordId || null;
-    if (!ordId) {
-      logger.error(`Order FAILED: ${instId} code=${d.sCode || res.code} msg=${d.sMsg || res.msg}`);
-      return { ordId: null, filled: false, fillPx: 0, errorMsg: d.sMsg || res.msg };
+    return this._request('POST', '/api/v5/trade/order', body, true);
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  Algo Orders (standalone TP/SL, used for breakeven adjustment)
+  // ═══════════════════════════════════════════════════════════════
+
+  async getPendingAlgoOrders(instId) {
+    const path = `/api/v5/trade/orders-algo-pending?ordType=conditional,oco&instId=${encodeURIComponent(instId)}`;
+    const res = await this._request('GET', path, null, true);
+    if (res && res.code === '0' && Array.isArray(res.data)) return res.data;
+    return [];
+  }
+
+  async cancelAlgoOrder(instId, algoId) {
+    const body = [{ instId, algoId }];
+    return this._request('POST', '/api/v5/trade/cancel-algos', body, true);
+  }
+
+  /**
+   * Place a standalone conditional order carrying BOTH a TP leg and SL leg (OCO-style).
+   * Used to re-establish the SL/TP pair after moving stop to breakeven.
+   */
+  async placeAlgoOrder({ instId, side, posSide, sz, tpTriggerPx, slTriggerPx, mgnMode = 'isolated', reduceOnly = true }) {
+    const body = {
+      instId,
+      tdMode: mgnMode,
+      side,
+      posSide,
+      ordType: 'oco',
+      sz: String(sz),
+      reduceOnly: String(reduceOnly),
+      tpTriggerPx: String(tpTriggerPx),
+      tpOrdPx: '-1',
+      tpTriggerPxType: 'last',
+      slTriggerPx: String(slTriggerPx),
+      slOrdPx: '-1',
+      slTriggerPxType: 'last',
+    };
+    return this._request('POST', '/api/v5/trade/order-algo', body, true);
+  }
+
+  /**
+   * Attempt to amend an existing algo order's SL trigger price directly (fast path).
+   * Falls back to cancel + re-place if amendment isn't supported for this order type.
+   */
+  async amendAlgoOrder(instId, algoId, { newSlTriggerPx, newTpTriggerPx } = {}) {
+    const body = [{ instId, algoId }];
+    if (newSlTriggerPx != null) body[0].newSlTriggerPx = String(newSlTriggerPx);
+    if (newTpTriggerPx != null) body[0].newTpTriggerPx = String(newTpTriggerPx);
+    return this._request('POST', '/api/v5/trade/amend-algos', body, true);
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  Positions
+  // ═══════════════════════════════════════════════════════════════
+
+  async getPositions(instId = null) {
+    const path = instId
+      ? `/api/v5/account/positions?instType=SWAP&instId=${encodeURIComponent(instId)}`
+      : `/api/v5/account/positions?instType=SWAP`;
+    const res = await this._request('GET', path, null, true);
+    if (res && res.code === '0' && Array.isArray(res.data)) {
+      return res.data.filter((p) => parseFloat(p.pos || '0') !== 0);
     }
-    logger.info(`Order accepted: ${ordId}, verifying fill...`);
-    await sleep(2000);
-    const details = await this.getOrderDetails(ordId, instId);
-    if (details) {
-      const isFilled = ['filled', 'partially_filled', 'effective'].includes(details.state);
-      if (isFilled) {
-        logger.info(`✅ FILLED: ${instId} ${okxOutcome} @ ${details.fillPx} | ordId=${ordId}`);
-        return { ordId, filled: true, fillPx: details.fillPx, fillSz: details.fillSz };
-      }
-      logger.warn(`⚠️ NOT FILLED: ${instId} state=${details.state}`);
-      return { ordId, filled: false, fillPx: 0, errorMsg: `state=${details.state}` };
-    }
-    return { ordId, filled: false, fillPx: 0, errorMsg: 'unverifiable' };
+    return [];
+  }
+
+  /**
+   * Fetch recently closed position history to determine realized PnL after a close.
+   */
+  async getPositionsHistory(instId, limit = 5) {
+    const path = `/api/v5/account/positions-history?instType=SWAP&instId=${encodeURIComponent(instId)}&limit=${limit}`;
+    const res = await this._request('GET', path, null, true);
+    if (res && res.code === '0' && Array.isArray(res.data)) return res.data;
+    return [];
+  }
+
+  async closePosition(instId, posSide, mgnMode = 'isolated') {
+    const body = { instId, posSide, mgnMode };
+    return this._request('POST', '/api/v5/trade/close-position', body, true);
   }
 }
 
