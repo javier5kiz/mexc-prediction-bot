@@ -1,11 +1,11 @@
 {
-  "name": "mexc-prediction-bot",
-  "version": "2.0.0",
-  "description": "OKX Underdog Value Bot — BTC/ETH 5min event contracts, paper trading with real market data",
+  "name": "okx-ema-bos-bot",
+  "version": "3.0.0",
+  "description": "OKX EMA(50) + Break of Structure perpetual futures bot — BTC/ETH, 45x leverage, 1% risk, 1:2.5 RR, breakeven at 1R",
   "main": "src/bot.js",
   "scripts": {
     "start": "node src/bot.js",
-    "dev": "node src/bot.js"
+    "dev": "node --watch src/bot.js"
   },
   "engines": {
     "node": ">=18"
