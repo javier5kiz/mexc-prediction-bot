@@ -5,7 +5,7 @@
  * SL at EMA(50), TP at 1:2.5 RR, breakeven move at 1R.
  * Demo trading by default (IS_DEMO=true) — flip to false for live later.
  *
- * Serves a stats dashboard + JSON API on PORT (default 8080, Railway sets its own).
+ * Serves a stats dashboard + JSON API on port 7860 (HuggingFace default).
  */
 
 const http = require('http');
@@ -15,7 +15,7 @@ const TradeLog = require('./tradeLog');
 const DiscordAlerter = require('./alerter');
 const { renderStatsJSON, renderDashboardHTML } = require('./dashboard');
 
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 7860;
 
 const ASSETS = [
   { id: 'BTC', instId: 'BTC-USDT-SWAP' },
@@ -34,7 +34,7 @@ async function main() {
   console.log(`💰 Risk: 1% of balance as margin × 45x leverage`);
   console.log('🎯 SL: at EMA(50)   TP: 1:2.5 RR   Breakeven move: @1R');
   console.log(`🧪 Mode: ${process.env.IS_DEMO === 'true' ? 'DEMO (paper, simulated)' : '🔴 LIVE'}`);
-  console.log(`🌐 Dashboard: port ${PORT}`);
+  console.log(`🌐 Dashboard: port ${PORT} (HuggingFace)`);
   console.log('==================================================\n');
 
   tradeLog = new TradeLog();
