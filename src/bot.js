@@ -6,13 +6,14 @@
  * Demo trading by default (IS_DEMO=true) — flip to false for live later.
  *
  * Serves a stats dashboard + JSON API on port 7860 (HuggingFace default).
+ * WhatsApp alerts via CallMeBot (free) — see alerter.js for setup.
  */
 
 const http = require('http');
 const OKXClient = require('./okxClient');
 const EmaBosTrader = require('./emaBosTrader');
 const TradeLog = require('./tradeLog');
-const DiscordAlerter = require('./alerter');
+const WhatsAppAlerter = require('./alerter');
 const { renderStatsJSON, renderDashboardHTML } = require('./dashboard');
 
 const PORT = process.env.PORT || 7860;
@@ -38,7 +39,10 @@ async function main() {
   console.log('==================================================\n');
 
   tradeLog = new TradeLog();
-  const alerter = new DiscordAlerter(process.env.DISCORD_WEBHOOK_URL);
+  const alerter = new WhatsAppAlerter({
+    phone: process.env.WHATSAPP_PHONE,
+    apiKey: process.env.WHATSAPP_API_KEY,
+  });
 
   // ── HTTP server: dashboard + JSON API ──────────────────────────────
   const server = http.createServer((req, res) => {
